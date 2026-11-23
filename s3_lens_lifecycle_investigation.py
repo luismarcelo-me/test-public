@@ -23,6 +23,12 @@ causas mais comuns:
      prefixo digitado diferente), regra desabilitada ou processamento
      assíncrono ainda em andamento.
 
+A seção 3 do relatório faz uma análise aprofundada do prefixo: cobertura dos
+dados, participação no bucket, balanço antes/depois, progresso diário,
+inferência do estado de versionamento (Enabled/Suspended/não versionado),
+decomposição do residual, residual por storage class e por subprefixo.
+Sem --rule-date, a data da regra é inferida pela primeira queda > 1%.
+
 Uso:
     python s3_lens_lifecycle_investigation.py \\
         --input ./lens_csv \\
@@ -252,6 +258,10 @@ class Report:
         self.add(title)
         self.add("=" * 78)
 
+    def sub(self, title: str) -> None:
+        self.add("")
+        self.add(f"--- {title} " + "-" * max(0, 74 - len(title)))
+
     def add(self, text: str = "") -> None:
         print(text)
         self.lines.append(text)
@@ -447,6 +457,425 @@ def versioning_timeline(r: Report, ts: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Análise aprofundada do prefixo
+# --------------------------------------------------------------------------- #
+COLD_CLASSES = {
+    "STANDARD_IA": 30, "ONEZONE_IA": 30, "GLACIER_IR": 90,
+    "GLACIER": 90, "DEEP_ARCHIVE": 180, "INTELLIGENT_TIERING": 0,
+}
+
+
+def has(ts: pd.DataFrame, key: str) -> bool:
+    return not ts.empty and key in ts and not ts[key].isna().all()
+
+
+def tib(v) -> str:
+    return "n/d" if v is None or pd.isna(v) else f"{v / 1024**4:,.2f}"
+
+
+def pct_of(v, base) -> str:
+    if v is None or base is None or pd.isna(v) or pd.isna(base) or not base:
+        return "n/d"
+    return f"{v / base * 100:.1f}%"
+
+
+def nz(v) -> float:
+    return 0.0 if v is None or pd.isna(v) else float(v)
+
+
+def dominant_cause(cur, nonc, mpu) -> str:
+    parts = {"correntes": nz(cur), "não correntes": nz(nonc), "multipart": nz(mpu)}
+    tot = sum(parts.values())
+    if tot <= 0:
+        return "-"
+    k = max(parts, key=parts.get)
+    return f"{k} ({parts[k] / tot * 100:.0f}%)"
+
+
+def infer_rule_date(ts: pd.DataFrame):
+    """Dia anterior à primeira queda > 1% (versões correntes, ou total)."""
+    col = "current_bytes" if has(ts, "current_bytes") else "total_bytes"
+    if not has(ts, col):
+        return None
+    s = ts[col].dropna()
+    if len(s) < 2 or s.iloc[0] <= 0:
+        return None
+    d = s.diff()
+    hits = d[d < -0.01 * s.iloc[0]]
+    if hits.empty:
+        return None
+    pos = list(s.index).index(hits.index[0])
+    return s.index[pos - 1]
+
+
+def prefix_pivot(rows: pd.DataFrame, lookup: Dict[str, str], day) -> pd.DataFrame:
+    inv = {v: k for k, v in lookup.items()}
+    sub = rows[(rows["report_date"] == day) & rows["metric_name"].isin(inv)]
+    if sub.empty:
+        return pd.DataFrame()
+    return (sub.groupby(["norm_prefix", "metric_name"])["metric_value"].sum()
+            .unstack("metric_name").rename(columns=inv))
+
+
+def deep_prefix_analysis(
+    r: "Report",
+    prefix_rows: pd.DataFrame,
+    exact_rows: pd.DataFrame,
+    ts_p: pd.DataFrame,
+    ts_b: pd.DataFrame,
+    prefix: str,
+    lookup: Dict[str, str],
+    rule_date,
+    rule_date_src: str,
+    out_dir: Path,
+) -> None:
+    last = ts_p.index[-1]
+    ref = nearest_on_or_before(ts_p.index, rule_date) if rule_date else None
+    if ref == last:
+        ref = None
+    conclusions: List[str] = []
+
+    # ------------------------------------------------------------------ 3.1
+    r.sub("3.1 Cobertura dos dados do prefixo")
+    p_dates = sorted(ts_p.index)
+    b_dates = sorted(ts_b.index) if not ts_b.empty else []
+    r.add(f"Dias com o prefixo no export: {len(p_dates)} | dias com o bucket: {len(b_dates)}")
+    missing = sorted(set(b_dates) - set(p_dates))
+    if missing:
+        r.add(f"Dias SEM registro do prefixo ({len(missing)}): "
+              f"{', '.join(map(str, missing[:10]))}{' ...' if len(missing) > 10 else ''}")
+        r.add("  O Lens só publica um prefixo quando ele passa do threshold (padrão "
+              "1% do bucket) e está dentro da profundidade configurada.")
+    if b_dates and b_dates[-1] > last:
+        r.add(f"ATENÇÃO: o prefixo deixou de aparecer após {last}, mas o bucket tem "
+              f"dados até {b_dates[-1]}. Os números do 'último dia' do prefixo podem "
+              "estar desatualizados (prefixo caiu abaixo do threshold?).")
+        conclusions.append(f"O prefixo sumiu do export após {last}; confirme o residual "
+                           "atual pelo nível do bucket ou via S3 Inventory.")
+    gaps = [(a, b) for a, b in zip(p_dates, p_dates[1:]) if (b - a).days > 1]
+    if gaps:
+        r.add("Lacunas no calendário do prefixo: "
+              + ", ".join(f"{a}->{b}" for a, b in gaps[:10]))
+    r.add("Métricas disponíveis no nível do prefixo:")
+    for key, label in (("total_bytes", "StorageBytes"), ("current_bytes", "CurrentVersionStorageBytes"),
+                       ("noncurrent_bytes", "NonCurrentVersionStorageBytes"),
+                       ("delete_marker_objects", "DeleteMarkerObjectCount"),
+                       ("mpu_bytes", "IncompleteMultipartUploadStorageBytes"),
+                       ("object_lock_bytes", "ObjectLockEnabledStorageBytes")):
+        r.add(f"  {'OK ' if has(ts_p, key) else '-- '} {label}")
+    if rule_date:
+        r.add(f"Data da regra: {rule_date} ({rule_date_src}) | dia de referência: "
+              f"{ref if ref else 'sem dado anterior disponível'} | último dia: {last}")
+    else:
+        r.add("Data da regra não informada e não foi possível inferir (nenhuma queda >1%).")
+
+    # ------------------------------------------------------------------ 3.2
+    r.sub("3.2 Participação do prefixo no bucket")
+    outside_last = float("nan")
+    for label, day in (("Referência", ref), ("Último dia", last)):
+        if day is None:
+            continue
+        pt = value_at(ts_p, day, "total_bytes")
+        bt = value_at(ts_b, day, "total_bytes")
+        out = bt - pt if not (pd.isna(bt) or pd.isna(pt)) else float("nan")
+        if day == last:
+            outside_last = out
+        r.add(f"  {label} ({day}): prefixo {fmt_bytes(pt)} = {pct_of(pt, bt)} do bucket "
+              f"| fora do prefixo {fmt_bytes(out)}")
+    bt_last = value_at(ts_b, last, "total_bytes")
+    if not pd.isna(outside_last) and bt_last and outside_last / bt_last >= 0.05:
+        conclusions.append(
+            f"{fmt_bytes(outside_last)} ({pct_of(outside_last, bt_last)} do bucket) "
+            f"estão FORA de {prefix} e não são afetados pela regra. Se o número de "
+            "'TB restantes' veio do bucket inteiro, essa parte não é falha do lifecycle.")
+
+    # ------------------------------------------------------------------ 3.3
+    keys = [("Total (bytes)", "total_bytes", True), ("Correntes (bytes)", "current_bytes", True),
+            ("Não correntes (bytes)", "noncurrent_bytes", True), ("Multipart (bytes)", "mpu_bytes", True),
+            ("Object Lock (bytes)", "object_lock_bytes", True), ("Total (objetos)", "total_objects", False),
+            ("Correntes (objetos)", "current_objects", False),
+            ("Não correntes (objetos)", "noncurrent_objects", False),
+            ("Delete markers (objetos)", "delete_marker_objects", False)]
+    if ref is not None:
+        r.sub(f"3.3 Balanço antes x depois ({ref} -> {last}) — bytes em TiB")
+        r.add(f"  {'Métrica':<26}{'Antes':>16}{'Depois':>16}{'Variação':>16}{'Var %':>9}")
+        balance = []
+        for label, k, is_b in keys:
+            if not has(ts_p, k):
+                continue
+            a, b = value_at(ts_p, ref, k), value_at(ts_p, last, k)
+            d = b - a
+            f = tib if is_b else fmt_count
+            r.add(f"  {label:<26}{f(a):>16}{f(b):>16}{(('+' if d >= 0 else '') + f(d)):>16}"
+                  f"{pct_of(d, a):>9}")
+            balance.append({"metrica": k, "antes": a, "depois": b, "variacao": d})
+        pd.DataFrame(balance).to_csv(out_dir / "prefix_balance.csv", index=False)
+
+    # ------------------------------------------------------------------ 3.4
+    r.sub("3.4 Progresso diário da deleção no prefixo (TiB)")
+    cols = ["total_bytes", "current_bytes", "noncurrent_bytes", "mpu_bytes", "delete_marker_objects"]
+    daily = ts_p[cols].astype(float).copy()
+    for c in cols:
+        daily["d_" + c] = daily[c].diff()
+    daily.to_csv(out_dir / "prefix_daily_progress.csv")
+    start = (ref - pd.Timedelta(days=3).to_pytimedelta()) if ref else daily.index[0]
+    view = daily[daily.index >= start]
+    header = (f"  {'Data':<12}{'Total':>10}{'Corr.':>10}{'Não corr.':>11}"
+              f"{'ΔTotal':>10}{'ΔCorr.':>10}{'ΔNãoCorr.':>11}{'ΔDelMarkers':>14}")
+    r.add(header)
+
+    def line(day, row):
+        mark = "  <- referência" if day == ref else ""
+        dm = row["d_delete_marker_objects"]
+        return (f"  {str(day):<12}{tib(row['total_bytes']):>10}{tib(row['current_bytes']):>10}"
+                f"{tib(row['noncurrent_bytes']):>11}{tib(row['d_total_bytes']):>10}"
+                f"{tib(row['d_current_bytes']):>10}{tib(row['d_noncurrent_bytes']):>11}"
+                f"{('n/d' if pd.isna(dm) else f'{dm:+,.0f}'):>14}{mark}")
+
+    rows_list = list(view.iterrows())
+    if len(rows_list) > 30:
+        for day, row in rows_list[:15]:
+            r.add(line(day, row))
+        r.add(f"  ... ({len(rows_list) - 30} dias omitidos; veja prefix_daily_progress.csv) ...")
+        rows_list = rows_list[-15:]
+    for day, row in rows_list:
+        r.add(line(day, row))
+
+    base_day = ref or daily.index[0]
+    base_total = value_at(ts_p, base_day, "total_bytes")
+    thr = max(0.001 * nz(base_total), 1024**3)
+    after = daily[daily.index > base_day]
+    drops = after[after["d_total_bytes"] < -thr]
+    if drops.empty:
+        r.add("\n  Nenhuma redução relevante após o dia de referência.")
+        if ref is not None:
+            conclusions.append("A regra não reduziu o prefixo após a data informada: "
+                               "verifique se a regra está Enabled e se o filtro bate com as chaves.")
+    else:
+        first_drop, last_drop = drops.index[0], drops.index[-1]
+        removed = base_total - value_at(ts_p, last_drop, "total_bytes")
+        days = max((last_drop - base_day).days, 1)
+        r.add(f"\n  Remoção relevante entre {first_drop} e {last_drop}: {fmt_bytes(removed)} "
+              f"em {days} dia(s) (~{fmt_bytes(removed / days)}/dia).")
+        if last_drop == last:
+            r.add("  A deleção AINDA ESTÁ EM ANDAMENTO no último dia disponível.")
+            conclusions.append("A deleção ainda estava ocorrendo no último dia do export: "
+                               "parte do residual pode simplesmente não ter sido processada ainda.")
+        else:
+            r.add(f"  Estável desde {last_drop} ({(last - last_drop).days} dia(s) sem "
+                  "remoção relevante): o residual não será removido pela regra atual.")
+    nc_growth = after["d_noncurrent_bytes"].clip(lower=0).sum() if has(ts_p, "noncurrent_bytes") else 0
+    if nc_growth > thr:
+        r.add(f"  Versões não correntes CRESCERAM {fmt_bytes(nc_growth)} durante o período "
+              "(objetos expirados que viraram noncurrent em vez de serem apagados).")
+
+    # ------------------------------------------------------------------ 3.5
+    r.sub("3.5 Inferência do estado do versionamento durante a execução da regra")
+    vs = {"nc_new": float("nan")}
+    if has(ts_p, "current_bytes") and has(ts_p, "noncurrent_bytes"):
+        sts, scope = ts_p, f"prefixo {prefix}"
+    else:
+        sts, scope = ts_b, "bucket inteiro (métricas de versão ausentes no prefixo)"
+    sref = nearest_on_or_before(sts.index, ref) if ref is not None else None
+    if sref is None or sts.empty:
+        r.add("  Sem dia de referência anterior à regra: não é possível comparar. "
+              "Informe --rule-date ou use exports anteriores à regra.")
+    else:
+        slast = sts.index[-1]
+        g = lambda d, k: value_at(sts, d, k)  # noqa: E731
+        dc = g(sref, "current_bytes") - g(slast, "current_bytes")
+        dn = g(slast, "noncurrent_bytes") - g(sref, "noncurrent_bytes")
+        ddm = g(slast, "delete_marker_objects") - g(sref, "delete_marker_objects")
+        dco = g(sref, "current_objects") - g(slast, "current_objects")
+        dno = g(slast, "noncurrent_objects") - g(sref, "noncurrent_objects")
+        r.add(f"  Escopo: {scope} | {sref} -> {slast}")
+        r.add(f"  Versões correntes removidas ........ {fmt_bytes(dc)} | {fmt_count(dco)} objetos")
+        r.add(f"  Variação das não correntes ......... {fmt_bytes(dn)} | {fmt_count(dno)} objetos")
+        r.add(f"  Delete markers criados ............. {fmt_count(ddm)}")
+        if not pd.isna(ddm) and not pd.isna(dco) and dco > 0:
+            r.add(f"  Delete markers por objeto expirado . {ddm / dco:.2f}")
+        cur_ref = g(sref, "current_bytes")
+        vs["nc_new"] = max(nz(dn), 0)
+
+        if pd.isna(dc) or pd.isna(dn):
+            state, expl = "INDETERMINADO", "métricas de versão incompletas."
+        elif dc <= 0.01 * nz(cur_ref):
+            state = "SEM EFEITO"
+            expl = ("a regra praticamente não removeu versões correntes. Verifique "
+                    "status da regra, filtro (prefixo/tags/tamanho) e Object Lock.")
+        else:
+            ratio = max(dn, 0) / dc
+            dm_up = pd.isna(ddm) or ddm > 0
+            if ratio >= 0.9:
+                state = "ENABLED (versionamento ATIVO)"
+                expl = (f"{ratio:.0%} do que saiu das versões correntes virou não corrente: "
+                        "a expiração só criou delete markers e nada foi apagado de fato.")
+            elif dm_up and ratio > 0.01:
+                state = "SUSPENDED, com objetos herdados do período Enabled"
+                expl = (f"apenas {ratio:.1%} ({fmt_bytes(dn)}) do expirado virou não corrente. "
+                        "Com versionamento Suspended, a expiração apaga de fato as versões "
+                        "'null' (criadas após a suspensão), mas versões correntes com "
+                        "VersionId real (criadas quando estava Enabled) apenas viram não "
+                        "correntes atrás de um delete marker. Isso é consistente com "
+                        "arquivos antigos (ex.: 2022) restantes.")
+            elif dm_up:
+                state = "SUSPENDED"
+                expl = ("os objetos expirados eram versões 'null' e foram apagados; o "
+                        "residual não corrente já existia antes da regra.")
+            else:
+                state = "NÃO VERSIONADO (comportamento observado)"
+                expl = ("objetos removidos sem gerar delete markers.")
+                if nz(g(sref, "noncurrent_bytes")) > 0:
+                    expl += (" Porém há versões não correntes, o que só existe se o "
+                             "versionamento já foi habilitado: confira se a métrica de delete "
+                             "markers está no export e o atraso do Lens.")
+        r.add(f"\n  Estado inferido: {state}")
+        r.add(f"  Motivo: {expl}")
+        conclusions.insert(0, f"Versionamento inferido durante a regra: {state}.")
+
+    # ------------------------------------------------------------------ 3.6
+    r.sub(f"3.6 Decomposição do residual em {last}")
+    tot_l = value_at(ts_p, last, "total_bytes")
+    cur_l = value_at(ts_p, last, "current_bytes")
+    nc_l = value_at(ts_p, last, "noncurrent_bytes")
+    mpu_l = value_at(ts_p, last, "mpu_bytes")
+    lock_l = value_at(ts_p, last, "object_lock_bytes")
+    comps = []
+    if ref is not None and has(ts_p, "noncurrent_bytes"):
+        nc_ref = value_at(ts_p, ref, "noncurrent_bytes")
+        nc_new = max(nz(nc_l) - nz(nc_ref), 0)
+        comps.append(("Não correntes já existentes antes da regra", nz(nc_l) - nc_new,
+                      "NoncurrentVersionExpiration"))
+        comps.append(("Não correntes geradas pela própria regra", nc_new,
+                      "NoncurrentVersionExpiration"))
+    else:
+        comps.append(("Versões não correntes (origem indeterminada)", nz(nc_l),
+                      "NoncurrentVersionExpiration"))
+    comps.append(("Versões correntes não expiradas", nz(cur_l),
+                  "revisar filtro/status da regra, Object Lock ou aguardar"))
+    comps.append(("Uploads multipart incompletos", nz(mpu_l), "AbortIncompleteMultipartUpload"))
+    explained = sum(c[1] for c in comps)
+    unexplained = nz(tot_l) - explained
+    r.add(f"  Total do prefixo: {fmt_bytes(tot_l)}")
+    for name, v, fix in sorted(comps, key=lambda c: -c[1]):
+        r.add(f"  {name:<46}{fmt_bytes(v):>32}  {pct_of(v, tot_l):>7}  -> {fix}")
+    r.add(f"  {'Diferença não explicada':<46}{fmt_bytes(unexplained):>32}  {pct_of(unexplained, tot_l):>7}")
+    r.add("  (StorageBytes inclui metadados e pode incluir MPU; diferenças pequenas são normais.)")
+    if not pd.isna(lock_l) and lock_l > 0:
+        r.add(f"  Destes, {fmt_bytes(lock_l)} ({pct_of(lock_l, tot_l)}) têm Object Lock habilitado: "
+              "versões sob retenção/legal hold não são apagadas até expirar a retenção.")
+        conclusions.append(f"{fmt_bytes(lock_l)} com Object Lock no prefixo: verifique "
+                           "retenções e legal holds antes de mudar a regra.")
+    if tot_l and abs(unexplained) / tot_l > 0.05:
+        conclusions.append(f"{fmt_bytes(unexplained)} não explicados pelas métricas de versão: "
+                           "confira se todas as métricas estão no export e se há mais de "
+                           "uma configuração do Lens (--config-id).")
+    top = max(comps, key=lambda c: c[1])
+    if tot_l and top[1] > 0:
+        conclusions.append(f"Maior parcela do residual: {top[0]} = {fmt_bytes(top[1])} "
+                           f"({pct_of(top[1], tot_l)}). Correção: {top[2]}.")
+
+    # ------------------------------------------------------------------ 3.7
+    r.sub("3.7 Residual por storage class (prefixo)")
+    sc_l = by_storage_class(exact_rows, lookup, last)
+    sc_r = by_storage_class(exact_rows, lookup, ref) if ref is not None else pd.DataFrame()
+    if sc_l.empty:
+        r.add("  Sem dados por storage class para o prefixo.")
+    else:
+        tab = pd.DataFrame(index=sorted(set(sc_l.index) | set(sc_r.index)))
+        for k in ("total_bytes", "current_bytes", "noncurrent_bytes"):
+            tab[k + "_ultimo"] = sc_l.get(k, pd.Series(dtype=float)).reindex(tab.index)
+        tab["total_bytes_ref"] = (sc_r.get("total_bytes", pd.Series(dtype=float)).reindex(tab.index)
+                                  if not sc_r.empty else float("nan"))
+        tab.to_csv(out_dir / "prefix_residual_by_storage_class.csv")
+        r.add(f"  {'Classe':<22}{'Antes':>10}{'Depois':>10}{'Removido':>10}"
+              f"{'Corr.':>10}{'Não corr.':>11}  (TiB)")
+        cold_hits = []
+        for cls, row in tab.sort_values("total_bytes_ultimo", ascending=False).iterrows():
+            a, b = row["total_bytes_ref"], row["total_bytes_ultimo"]
+            rem = (1 - b / a) if a and not pd.isna(a) and not pd.isna(b) else float("nan")
+            r.add(f"  {cls:<22}{tib(a):>10}{tib(b):>10}"
+                  f"{('n/d' if pd.isna(rem) else f'{rem:.0%}'):>10}"
+                  f"{tib(row['current_bytes_ultimo']):>10}{tib(row['noncurrent_bytes_ultimo']):>11}")
+            if cls in COLD_CLASSES and nz(b) > 0:
+                cold_hits.append(cls)
+        if cold_hits:
+            r.add("  Classes com duração mínima de cobrança no residual: "
+                  + ", ".join(f"{c} ({COLD_CLASSES[c]}d)" for c in cold_hits)
+                  + ". Isso NÃO impede a deleção, mas gera cobrança proporcional se "
+                  "apagado antes do mínimo. Não correntes em GLACIER/DEEP_ARCHIVE "
+                  "costumam indicar uma regra NoncurrentVersionTransition existente.")
+
+    # ------------------------------------------------------------------ 3.8
+    r.sub(f"3.8 Onde está o residual: subprefixos de {prefix}")
+    base_depth = prefix.count("/")
+    subs = prefix_rows[prefix_rows["norm_prefix"].str.startswith(prefix)
+                       & (prefix_rows["norm_prefix"] != prefix)].copy()
+    if subs.empty:
+        r.add("  Nenhum subprefixo no export. Aumente a profundidade (prefix depth) e/ou "
+              "reduza o threshold do prefix aggregation no Lens para detalhar.")
+    else:
+        p_l = prefix_pivot(subs, lookup, last)
+        p_r = prefix_pivot(subs, lookup, ref) if ref is not None else pd.DataFrame()
+        det = pd.DataFrame(index=sorted(set(p_l.index) | set(p_r.index)))
+        det["depth"] = [p.count("/") for p in det.index]
+        det["total_ref"] = (p_r.get("total_bytes", pd.Series(dtype=float)).reindex(det.index)
+                            if not p_r.empty else float("nan"))
+        for k, c in (("total_bytes", "total_last"), ("current_bytes", "current_last"),
+                     ("noncurrent_bytes", "noncurrent_last"), ("mpu_bytes", "mpu_last")):
+            det[c] = (p_l.get(k, pd.Series(dtype=float)).reindex(det.index)
+                      if not p_l.empty else float("nan"))
+        det["removido_pct"] = 1 - det["total_last"] / det["total_ref"]
+        det["share_residual"] = det["total_last"] / tot_l if tot_l else float("nan")
+        det["causa_dominante"] = [dominant_cause(a, b, c) for a, b, c in
+                                  zip(det["current_last"], det["noncurrent_last"], det["mpu_last"])]
+        det.sort_values(["depth", "total_last"], ascending=[True, False]).to_csv(
+            out_dir / "prefix_subprefixes_detail.csv")
+
+        def show(level_df, n):
+            r.add(f"  {'Subprefixo':<40}{'Antes':>9}{'Depois':>9}{'Remov.':>8}"
+                  f"{'%resid.':>9}  Causa dominante   (TiB)")
+            for p, row in level_df.sort_values("total_last", ascending=False).head(n).iterrows():
+                rem = row["removido_pct"]
+                r.add(f"  {p[:39]:<40}{tib(row['total_ref']):>9}{tib(row['total_last']):>9}"
+                      f"{('n/d' if pd.isna(rem) else f'{rem:.0%}'):>8}"
+                      f"{('n/d' if pd.isna(row['share_residual']) else f'{row.share_residual:.1%}'):>9}"
+                      f"  {row['causa_dominante']}")
+
+        direct = det[det["depth"] == base_depth + 1]
+        if not direct.empty:
+            r.add(f"Nível imediato ({len(direct)} subprefixo(s)), ordenado pelo residual:")
+            show(direct, 25)
+            cov = direct["total_last"].sum() / tot_l if tot_l else float("nan")
+            r.add(f"  Residual atribuído aos subprefixos diretos: {pct_of(direct['total_last'].sum(), tot_l)}"
+                  " (o restante está em objetos direto no prefixo ou em subprefixos abaixo do threshold).")
+            if not pd.isna(cov) and cov > 0:
+                top_sub = direct["total_last"].idxmax()
+                conclusions.append(
+                    f"Residual concentrado em {top_sub} ({pct_of(direct.at[top_sub, 'total_last'], tot_l)} "
+                    f"do prefixo; causa dominante: {direct.at[top_sub, 'causa_dominante']}).")
+            low = direct[(direct["removido_pct"] < 0.5) & (direct["total_ref"] > thr)]
+            if not low.empty:
+                r.add("  Subprefixos com remoção < 50% (comportamento diferente do resto): "
+                      + ", ".join(low.index[:10]))
+                conclusions.append(
+                    "Subprefixos com remoção abaixo de 50%: " + ", ".join(low.index[:5])
+                    + ". Compare com os que foram limpos: idade dos objetos (período em que o "
+                      "versionamento estava Enabled), tags, Object Lock ou storage class.")
+        for depth in sorted(d for d in det["depth"].unique() if d > base_depth + 1)[:3]:
+            lvl = det[det["depth"] == depth]
+            r.add(f"\nNível {depth - base_depth} abaixo de {prefix} — top 10 ({len(lvl)} no total):")
+            show(lvl, 10)
+
+    # ------------------------------------------------------------------ 3.9
+    r.sub(f"3.9 Conclusão para o prefixo {prefix}")
+    for i, c in enumerate(conclusions, 1):
+        r.add(f"  {i}. {c}")
+    if not conclusions:
+        r.add("  Sem conclusões automáticas; revise as tabelas acima.")
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> int:
@@ -459,6 +888,7 @@ def main() -> int:
     ap.add_argument("--prefix", "-p", default="exp/", help="Prefixo da lifecycle rule (default: exp/)")
     ap.add_argument("--rule-date", help="Data de aplicação da regra (YYYY-MM-DD) para comparação antes/depois")
     ap.add_argument("--output", "-o", default="./lens_investigation_output", help="Diretório de saída")
+    ap.add_argument("--config-id", help="Filtrar uma única configuração do Lens (configuration_id)")
     ap.add_argument("--chunksize", type=int, default=500_000, help="Linhas por chunk na leitura")
     args = ap.parse_args()
 
@@ -485,6 +915,13 @@ def main() -> int:
         r.save(out_dir / "report.txt")
         return 2
 
+    if args.config_id:
+        df = df[df["configuration_id"] == args.config_id]
+        if df.empty:
+            r.add(f"Nenhuma linha para configuration_id={args.config_id}.")
+            r.save(out_dir / "report.txt")
+            return 2
+
     df.to_csv(out_dir / "bucket_raw_rows.csv.gz", index=False, compression="gzip")
 
     dates = sorted(d for d in df["report_date"].dropna().unique())
@@ -496,8 +933,8 @@ def main() -> int:
     r.add(f"record_type presentes: {', '.join(sorted(df['record_type'].unique()))}")
     r.add(f"Storage classes: {', '.join(sorted(df['storage_class'].unique()))}")
     if len(df["configuration_id"].unique()) > 1:
-        r.add("ATENÇÃO: mais de uma configuração do Lens. Os valores podem estar "
-              "duplicados entre configurações; considere filtrar uma só.")
+        r.add("ATENÇÃO: mais de uma configuração do Lens. Os valores serão SOMADOS "
+              "entre configurações (duplicação); use --config-id para escolher uma.")
 
     metric_names = sorted(df["metric_name"].unique())
     (out_dir / "metric_names.txt").write_text("\n".join(metric_names) + "\n", encoding="utf-8")
@@ -548,25 +985,8 @@ def main() -> int:
             describe_snapshot(r, "Primeiro dia disponível", ts_prefix, ts_prefix.index[0])
             describe_snapshot(r, "Último dia disponível", ts_prefix, ts_prefix.index[-1])
 
-        # Subprefixos (NÃO somar: níveis aninhados se sobrepõem).
-        last = max(prefix_df["report_date"])
-        sub = prefix_df[(prefix_df["report_date"] == last)
-                        & prefix_df["norm_prefix"].str.startswith(prefix)
-                        & (prefix_df["metric_name"].isin(
-                            [lookup.get("total_bytes"), lookup.get("noncurrent_bytes")]))]
-        if not sub.empty:
-            inv = {v: k for k, v in lookup.items()}
-            piv = (sub.groupby(["norm_prefix", "metric_name"])["metric_value"].sum()
-                   .unstack("metric_name").rename(columns=inv).fillna(0)
-                   .sort_values("total_bytes", ascending=False))
-            piv.to_csv(out_dir / "latest_subprefixes.csv")
-            r.add(f"\nPrefixos sob {prefix} no último dia ({last}) - top 20 "
-                  "(níveis aninhados se sobrepõem, não some):")
-            for p, row in piv.head(20).iterrows():
-                r.add(f"  {p:<45} total {fmt_bytes(row.get('total_bytes', 0)):>28} | "
-                      f"noncurrent {fmt_bytes(row.get('noncurrent_bytes', 0))}")
-
         # Outros prefixos de 1º nível fora do escopo da regra.
+        last = max(prefix_df["report_date"])
         top = prefix_df[(prefix_df["report_date"] == last)
                         & (prefix_df["metric_name"] == lookup.get("total_bytes"))].copy()
         top["depth"] = top["norm_prefix"].str.count("/")
@@ -578,20 +998,30 @@ def main() -> int:
                 tag = "  <- escopo da regra" if p == prefix else ""
                 r.add(f"  {p:<45} {fmt_bytes(v)}{tag}")
 
+    # ---------------- Data da regra ----------------
+    rule_date_src = "informada via --rule-date"
+    if rule_date is None:
+        rule_date = infer_rule_date(ts_prefix if not ts_prefix.empty else ts_bucket)
+        rule_date_src = "INFERIDA: dia anterior à primeira queda > 1% das versões correntes"
+
+    # ---------------- Análise aprofundada ----------------
+    r.h(f"3. ANÁLISE APROFUNDADA DO PREFIXO {prefix}")
+    if ts_prefix.empty:
+        r.add("Indisponível: o prefixo não tem registros PREFIX no export.")
+    else:
+        deep_prefix_analysis(r, prefix_df, exact, ts_prefix, ts_bucket, prefix, lookup,
+                             rule_date, rule_date_src, out_dir)
+
     # ---------------- Versionamento ----------------
-    r.h("3. LINHA DO TEMPO DE VERSIONAMENTO")
+    r.h("4. LINHA DO TEMPO DE VERSIONAMENTO")
     versioning_timeline(r, ts_prefix if not ts_prefix.empty else ts_bucket)
 
     # ---------------- Diagnóstico ----------------
-    r.h("4. DIAGNÓSTICO")
-    if not ts_prefix.empty:
-        diagnose(r, ts_prefix, f"prefixo {prefix}", rule_date)
-        r.add("")
-        r.add("-" * 78)
+    r.h("5. DIAGNÓSTICO DO BUCKET INTEIRO")
     diagnose(r, ts_bucket, "bucket inteiro", rule_date)
 
     # ---------------- Próximos passos ----------------
-    r.h("5. PRÓXIMOS PASSOS SUGERIDOS")
+    r.h("6. PRÓXIMOS PASSOS SUGERIDOS")
     r.add(f"""\
   * Confirmar estado do versionamento:
       aws s3api get-bucket-versioning --bucket {args.bucket}
@@ -602,7 +1032,13 @@ def main() -> int:
       aws s3api list-object-versions --bucket {args.bucket} --prefix {prefix} \\
         --max-items 1000 --query 'Versions[?IsLatest==`false`].[Key,VersionId,LastModified,Size]'
   * Para inventário completo, use S3 Inventory com 'Include all versions'
-    e consulte via Athena (IsLatest, IsDeleteMarker, LastModified, ObjectLock*).
+    e consulte via Athena para confirmar idade e tipo do residual:
+      SELECT year(last_modified_date) AS ano, is_latest, is_delete_marker,
+             storage_class, count(*) AS objetos,
+             sum(size)/power(1024,4) AS tib
+      FROM inventario
+      WHERE key LIKE '{prefix}%'
+      GROUP BY 1,2,3,4 ORDER BY 1;
   * Regra corrigida sugerida para o prefixo {prefix}:
       {{
         "ID": "expire-{prefix.strip('/')}",
