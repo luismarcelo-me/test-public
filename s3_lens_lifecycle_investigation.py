@@ -47,6 +47,7 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
+from urllib.parse import unquote
 
 import pandas as pd
 
@@ -110,7 +111,8 @@ def fmt_count(value: float) -> str:
 
 
 def normalize_prefix(p: str) -> str:
-    p = (p or "").strip().lstrip("/")
+    # O Lens grava prefixos aninhados com "/" codificado: "exp%2Fcanais/".
+    p = unquote((p or "").strip()).lstrip("/")
     return p if p.endswith("/") or p == "" else p + "/"
 
 
@@ -208,8 +210,8 @@ def timeseries(df: pd.DataFrame, lookup: Dict[str, str]) -> pd.DataFrame:
     )
     for k in METRICS:
         if k not in ts.columns:
-            ts[k] = pd.NA
-    return ts[list(METRICS)]
+            ts[k] = float("nan")
+    return ts[list(METRICS)].astype(float)
 
 
 def by_storage_class(df: pd.DataFrame, lookup: Dict[str, str], day) -> pd.DataFrame:
@@ -797,7 +799,7 @@ def deep_prefix_analysis(
             r.add(f"  {cls:<22}{tib(a):>10}{tib(b):>10}"
                   f"{('n/d' if pd.isna(rem) else f'{rem:.0%}'):>10}"
                   f"{tib(row['current_bytes_ultimo']):>10}{tib(row['noncurrent_bytes_ultimo']):>11}")
-            if cls in COLD_CLASSES and nz(b) > 0:
+            if COLD_CLASSES.get(cls, 0) > 0 and nz(b) > 0:
                 cold_hits.append(cls)
         if cold_hits:
             r.add("  Classes com duração mínima de cobrança no residual: "
@@ -833,11 +835,12 @@ def deep_prefix_analysis(
             out_dir / "prefix_subprefixes_detail.csv")
 
         def show(level_df, n):
-            r.add(f"  {'Subprefixo':<40}{'Antes':>9}{'Depois':>9}{'Remov.':>8}"
+            w = max([12] + [len(p) for p in level_df.index]) + 2
+            r.add(f"  {'Subprefixo':<{w}}{'Antes':>9}{'Depois':>9}{'Remov.':>8}"
                   f"{'%resid.':>9}  Causa dominante   (TiB)")
             for p, row in level_df.sort_values("total_last", ascending=False).head(n).iterrows():
                 rem = row["removido_pct"]
-                r.add(f"  {p[:39]:<40}{tib(row['total_ref']):>9}{tib(row['total_last']):>9}"
+                r.add(f"  {p:<{w}}{tib(row['total_ref']):>9}{tib(row['total_last']):>9}"
                       f"{('n/d' if pd.isna(rem) else f'{rem:.0%}'):>8}"
                       f"{('n/d' if pd.isna(row['share_residual']) else f'{row.share_residual:.1%}'):>9}"
                       f"  {row['causa_dominante']}")
