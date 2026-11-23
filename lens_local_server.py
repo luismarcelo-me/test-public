@@ -221,6 +221,25 @@ def list_uploads():
     return rows
 
 
+def lan_addresses() -> list:
+    """IPs desta máquina na rede local (sem enviar tráfego)."""
+    import socket
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))  # UDP: só escolhe a interface, não envia nada
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith("127."))
+
+
 def main() -> int:
     global DATA_DIR
     ap = argparse.ArgumentParser(description="Servidor web local para análise do S3 Storage Lens.")
@@ -236,6 +255,12 @@ def main() -> int:
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{args.port}"
     print(f"Servidor no ar: {url}")
+    if args.host in ("0.0.0.0", "::"):
+        for ip in lan_addresses():
+            print(f"Na rede:        http://{ip}:{args.port}")
+        print("ATENÇÃO: escutando em todas as interfaces e SEM autenticação. Qualquer "
+              "pessoa na sua rede pode enviar arquivos e ler os resultados. Use só em "
+              "rede confiável e encerre ao terminar.")
     print(f"Dados em: {DATA_DIR}")
     print("Ctrl+C para encerrar.")
     if args.open:
